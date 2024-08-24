@@ -1,0 +1,765 @@
+#Import Part
+#----------------------------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import xgboost as xgb
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import make_scorer, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.utils import resample
+from sklearn.decomposition import PCA  
+from tensorflow.keras.models import Sequential  
+from tensorflow.keras.layers import Dense, Dropout
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
+from tensorflow.keras.utils import set_random_seed 
+from sklearn.model_selection import KFold, cross_val_score  
+from scipy.fftpack import fftfreq
+from scipy.integrate import quad
+from scipy.stats import f_oneway
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from tensorflow.keras.optimizers import Adam
+from scipy.signal import stft, get_window
+import mne
+from mne import create_info
+from mne.channels import make_standard_montage
+from mne.io import RawArray
+from mne.viz import plot_topomap
+from sklearn.preprocessing import MinMaxScaler
+
+
+#Define
+#----------------------------------------------
+nChannels = 64
+nSamples = 614 #1.2 econd
+nParticipant = range(2,21)
+preTime = int(512 * 0.2) #0.2 second
+channel_names = ['Fp1', 'Fpz', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'P9', 'FC1', 
+                 'FC2', 'P10', 'FT9', 'T7', 'C3', 'Cz', 'C4', 'T8', 'FT10', 'PO9',
+                 'CP1', 'CP2', 'PO10', 'P7', 'P3', 'Pz', 'P4', 'P8', 'POz', 'O1', 
+                 'Oz', 'O2', 'TP9', 'AF3', 'AF4', 'TP10', 'F5', 'F1', 'F2', 'F6', 
+                 'FC3', 'FCz', 'FC4', 'C5', 'C1', 'C2', 'C6', 'CP3', 'CPz', 'CP4', 
+                 'P5', 'P1', 'P2', 'P6', 'O9', 'PO3', 'PO4', 'O10', 'FT7', 'FT8', 'TP7', 'TP8', 'PO7', 'PO8'] 
+
+time_periods = ['0-200','200-400','400-600','600-800','800-1000']
+bands_names = ['Delta', 'Theta', 'Alpha', 'Beta', 'Gamma']
+
+
+# 1.Data loading and processing
+#----------------------------------------------
+#Load data function
+def load_mulfile(filename, startRow=3, endRow=None):
+    if endRow is None:
+        endRow = np.inf
+    with open(filename, 'r') as file:
+        dataArray = np.genfromtxt(file, delimiter='', skip_header=startRow - 1, max_rows=endRow - startRow + 1)
+
+    return dataArray
+
+
+
+#Data processing function
+def process_data(filename, nSamples, nChannels, preTime):
+    rawdata = load_mulfile(filename, 3)
+    nTrials = int(len(rawdata) / nSamples)
+    rawdata_reshape = rawdata.reshape((nTrials, nSamples, nChannels)).transpose((2, 1, 0))
+    preTime_mean = np.mean(rawdata_reshape[:, :preTime, :], axis=1, keepdims=True)
+    processed_data = rawdata_reshape[:, preTime:612, :] - preTime_mean
+    output_data = processed_data.transpose(2, 1, 0).reshape(nTrials, -1)
+    
+    return output_data
+
+
+#Generate data function
+def generate_datalist():
+    #Store each participants data in list
+    data_lie = []
+    data_true = []
+    data_unf = []
+    
+    #load data
+    for number in nParticipant:
+        filename_lie = f"Data/Part{number:02}_Lie-export.mul"
+        filename_true = f"Data/Part{number:02}_True-export.mul"
+        filename_unf = f"Data/Part{number:02}_Unf-export.mul"
+        
+        #Resample to make each participent trials equals 105 (35 * 3)
+        lie_tmp = process_data(filename_lie, nSamples, nChannels, preTime)[:35]
+        true_tmp = process_data(filename_true, nSamples, nChannels, preTime)[:35]
+        unf_tmp = process_data(filename_unf, nSamples, nChannels, preTime)[:35]
+        
+        if len(lie_tmp) < 35:
+            lie_tmp = np.concatenate([lie_tmp, resample(lie_tmp,replace=True,n_samples=35-len(lie_tmp), random_state=2024)])
+        if len(true_tmp) < 35:
+            true_tmp = np.concatenate([true_tmp, resample(true_tmp,replace=True,n_samples=35-len(true_tmp), random_state=2024)])
+        if len(unf_tmp) < 35:
+            unf_tmp = np.concatenate([unf_tmp, resample(unf_tmp,replace=True,n_samples=35-len(unf_tmp), random_state=2024)])
+
+        data_lie.append(lie_tmp)
+        data_true.append(true_tmp)
+        data_unf.append(unf_tmp)
+
+    if len(data_lie) == len(data_true) == len(data_unf) == len(nParticipant):
+        print("Data Loading Finished")
+    else:
+        print("Something Wrong in data loading!")
+        
+    
+    #Combine all the data 
+    data_lie_combined = np.concatenate(data_lie, axis=0) 
+    data_true_combined = np.concatenate(data_true, axis=0) 
+    data_unf_combined = np.concatenate(data_unf, axis=0) 
+    
+    #Resample unf data to build the model
+    data_unf_resampled_model = np.concatenate([data_unf_combined, resample(data_unf_combined,replace=True,n_samples=len(data_unf_combined), random_state=2024)])
+    
+    if len(data_lie_combined) + len(data_true_combined) == len(data_unf_resampled_model):
+        print("Resample Finished")
+    else:
+        print("Something Wrong in resample!")
+    
+    #Final data
+    data_all = np.concatenate([data_lie_combined,data_true_combined,data_unf_combined])
+    data_all_model = np.concatenate([data_lie_combined,data_true_combined,data_unf_resampled_model])
+    
+    return [data_all,data_all_model]
+
+#Generate data
+data_all,data_all_model = generate_datalist()
+print("data shape :",data_all_model.shape)
+
+data_all_model_3d = data_all_model.reshape(2660,510,64)
+
+#Add data label
+data_all_label = np.array([0] * 1330 + [1] * 665)
+data_all_label_model = np.array([0] * 1330 + [1] * 1330)
+
+
+# 2.Find best time period
+#----------------------------------------------
+bands = {'Delta': (1, 3), 'Theta': (4, 7), 'Alpha': (8, 13), 'Beta': (14, 30), 'Gamma': (31, 40)}
+fs = 510
+nfft = 512
+nperseg = 102
+
+#Calcute frequency
+f, t, amplitude = stft(data_all_model_3d[0, :, 0], fs=fs, window='hann', nperseg=nperseg, noverlap=0, nfft=nfft)
+#print(f)
+
+stft_data = []
+for i in range(64): 
+    data_stft_tmp = data_all_model_3d[:, :, i]
+    f_s, t_s, amplitude_s = stft(data_stft_tmp, fs=fs, window='hann', nperseg=nperseg, noverlap=0, nfft=nfft, axis=1)
+    psd = (np.abs(amplitude_s) ** 2) / (fs / nperseg)
+    stft_data.append(psd)
+
+stft_data_trials = np.stack(stft_data, axis=-1)
+print("STFT data shape:", stft_data_trials.shape)
+
+#Get 5 bands
+data_all_band = []
+for band, (f_low, f_high) in bands.items():
+    idx_band = np.where((f >= f_low) & (f < f_high))[0]
+    band_data = stft_data_trials[:, idx_band, :, :]
+    data_all_band.append(band_data)
+
+for i in data_all_band:
+    print("5 Bands Data shape:",i.shape)
+
+
+# Divide each band data into 5 time periods
+data_band_time = []
+
+for band_data in data_all_band:
+    num_time_periods = 5
+    period_length = band_data.shape[2] // num_time_periods
+    band_time_data = []
+
+    for period in range(num_time_periods):
+        start = period * period_length
+        end = start + period_length
+        period_data = band_data[:, :, start:end, :].reshape(2660, -1)
+        band_time_data.append(period_data)
+    
+    data_band_time.append(band_time_data)
+
+    
+#Compute PSD mean value
+data_fam_de_band_time = []
+data_unf_de_band_time = []
+
+for band_data in data_band_time:
+    for period_data in band_data:
+        fam_de = [np.mean(i) for i in period_data[:1330]]
+        data_fam_de_band_time.extend(fam_de)
+        unf_de = [np.mean(i) for i in period_data[1330:]]
+        data_unf_de_band_time.extend(unf_de)
+        
+if len(data_fam_de_band_time) == len(data_unf_de_band_time) == 25 * 1330:
+    print("Frquency bands devided finished")
+else:
+    print("Something Wrong!")
+
+
+#Draw PSD frequency plot
+fam_psd = np.mean(stft_data_trials[:1330, :, :, :], axis=0)
+unf_psd = np.mean(stft_data_trials[1330:, :, :, :], axis=0)
+
+fam_psd_mean = fam_psd.reshape(257,-1).mean(axis=1)
+unf_psd_mean = unf_psd.reshape(257,-1).mean(axis=1)
+
+fam_psd_heatmap = fam_psd.mean(axis=2)
+unf_psd_heatmap = unf_psd.mean(axis=2)
+
+print(len(fam_psd_mean))
+print(unf_psd_mean.shape)
+
+plt.figure(figsize=(10, 5))
+plt.plot(f_s[0:41], fam_psd_mean[0:41], label='Familiar', color='red')
+plt.plot(f_s[0:41], unf_psd_mean[0:41], label='Unfamiliar', color='black')
+plt.title('PSD Value on Frequency Bands')
+plt.xlabel('Frequency (Hz)')
+plt.ylabel('PSD (μV²/Hz)')
+plt.legend()
+plt.show()
+
+#Normalized
+fam_psd_min = np.min(fam_psd_heatmap)
+fam_psd_max = np.max(fam_psd_heatmap)
+fam_psd_normalized = (fam_psd_heatmap - fam_psd_min) / (fam_psd_max - fam_psd_min)
+
+
+unf_psd_min = np.min(unf_psd_heatmap)
+unf_psd_max = np.max(unf_psd_heatmap)
+unf_psd_normalized = (unf_psd_heatmap - unf_psd_min) / (unf_psd_max - unf_psd_min)
+
+#print(fam_psd_normalized.shape)
+#print(unf_psd_normalized.shape)
+
+
+#Draw the heatmap
+plt.figure(figsize=(12, 6))
+
+plt.subplot(1, 2, 1)
+plt.pcolormesh(fam_psd_normalized[:41,:], shading='gouraud')
+plt.title('Familiar PSD')
+plt.xlabel('Time (ms)')
+plt.ylabel('Frequency (Hz)')
+plt.xticks(np.arange(6),["0","200","400","600","800","1000"]) 
+plt.colorbar(label='PSD (μV²/Hz)')
+
+
+plt.subplot(1, 2, 2)
+plt.pcolormesh(unf_psd_normalized[:41,:], shading='gouraud')
+plt.title('Unfamiliar PSD')
+plt.xlabel('Time (ms)')
+plt.ylabel('Frequency (Hz)')
+plt.xticks(np.arange(6),["0","200","400","600","800","1000"]) 
+plt.colorbar(label='PSD (μV²/Hz)')
+
+
+plt.tight_layout()
+plt.show()
+
+#ANOVA
+data_fam_de_band_time = np.array(data_fam_de_band_time).reshape(5,5,-1)
+data_unf_de_band_time = np.array(data_unf_de_band_time).reshape(5,5,-1)
+
+# ANOVA for time periods
+p_values_time = []
+num_time_segments = 5
+
+for i in range(num_time_segments):
+    fam_time = data_fam_de_band_time[0:4, i, :].flatten()
+    unf_time = data_unf_de_band_time[0:4, i, :].flatten()
+    
+    f_stat, p_val = f_oneway(fam_time, unf_time)
+    p_values_time.append(p_val)
+
+plt.figure(figsize=(10, 6))
+plt.bar(time_periods, p_values_time, color='skyblue')
+plt.axhline(y=0.05, color='r', linestyle='--', label='Significance Level (0.05)')
+plt.xlabel('Time Periods')
+plt.ylabel('P value')
+plt.title('ANOVA P values for 5 Time Periods')
+plt.legend()
+plt.show()
+
+for segment, p_val in zip(time_periods, p_values_time):
+    print(f'Time period {segment}: P value = {p_val:.4f}')
+    
+    
+# ANOVA for frequency bands
+p_values_bands = []
+
+for i in range(len(bands_names)):
+    fam_band = data_fam_de_band_time[i, :, :].flatten()
+    unf_band = data_unf_de_band_time[i, :, :].flatten()
+    
+    f_stat, p_val = f_oneway(fam_band, unf_band)
+    p_values_bands.append(p_val)
+
+plt.figure(figsize=(10, 6))
+plt.bar(bands_names, p_values_bands, color='skyblue')
+plt.axhline(y=0.05, color='r', linestyle='--', label='Significance Level (0.05)')
+plt.xlabel('Frequency Bands')
+plt.ylabel('P value')
+plt.title('ANOVA P values for 5 Frequency Bands')
+plt.legend()
+plt.show()
+
+for band, p_val in zip(bands_names, p_values_bands):
+    print(f'Frequency band {band}: P value = {p_val:.4f}')
+
+
+#Channel importance
+#-------------------------------------------------------------
+features_bands_d = []
+features_bands_t = []
+features_bands_a = []
+
+for trial in range(2660):
+    feature_tmp_d = []
+    feature_tmp_t = []
+    feature_tmp_a = []
+    
+    for channel in range(64):
+        # Delta band
+        delta_t2 = data_all_band[0][trial, :, 1, channel].flatten()
+        delta_t3 = data_all_band[0][trial, :, 2, channel].flatten()
+        
+        # Theta band
+        theta_t2 = data_all_band[1][trial, :, 1, channel].flatten()
+        theta_t3 = data_all_band[1][trial, :, 2, channel].flatten()
+        
+        # Alpha band
+        alpha_t2 = data_all_band[2][trial, :, 1, channel].flatten()
+        alpha_t3 = data_all_band[2][trial, :, 2, channel].flatten()
+        
+        # Beta band
+        #beta_t2 = data_all_band[3][trial, :, 1, channel].flatten()
+        #beta_t3 = data_all_band[3][trial, :, 2, channel].flatten()
+        
+        # Compute mean value
+        feature_tmp_d.append(np.mean(delta_t2))
+        feature_tmp_d.append(np.mean(delta_t3))
+        feature_tmp_t.append(np.mean(theta_t2))
+        feature_tmp_t.append(np.mean(theta_t3))
+        feature_tmp_a.append(np.mean(alpha_t2))
+        feature_tmp_a.append(np.mean(alpha_t3))      
+    
+    features_bands_d.append(feature_tmp_d)
+    features_bands_t.append(feature_tmp_t)
+    features_bands_a.append(feature_tmp_a)
+
+if len(features_bands_d) == len(features_bands_t) == len(features_bands_a) == 2660 and len(features_bands_d[0]) == 64 * 2:
+    print("Good in Mean Value")
+else:
+    print("Something Wrong in Mean Value")
+
+# Split data
+x_train_d, x_test_d, y_train_d, y_test_d = train_test_split(np.array(features_bands_d), data_all_label_model, test_size=0.2, random_state=2024)
+x_train_t, x_test_t, y_train_t, y_test_t = train_test_split(np.array(features_bands_t), data_all_label_model, test_size=0.2, random_state=2024)
+x_train_a, x_test_a, y_train_a, y_test_a = train_test_split(np.array(features_bands_a), data_all_label_model, test_size=0.2, random_state=2024)
+
+#Define a function get importance
+def compute_feature_importances_cv(x_data, y_data, n_splits=5):
+    kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=2023)
+    importances = np.zeros(x_data.shape[1])
+    accuracies = []
+    for train_idx, test_idx in kfold.split(x_data, y_data):
+        x_train, x_test = x_data[train_idx], x_data[test_idx]
+        y_train, y_test = y_data[train_idx], y_data[test_idx]
+        
+        model = RandomForestClassifier(random_state=2023)
+        model.fit(x_train, y_train)
+        
+        importances += model.feature_importances_
+        
+        y_pred = model.predict(x_test)
+        accuracy = accuracy_score(y_test, y_pred)
+        accuracies.append(accuracy)
+        
+    importances /= n_splits
+    average_accuracy = np.mean(accuracies)
+    
+    return importances, average_accuracy
+
+#Delta 
+importances_d,accuracy_d = compute_feature_importances_cv(x_train_d, y_train_d)
+channel_importances_d = np.array([sum(importances_d[i:i+2]) for i in range(0, len(importances_d), 2)])
+
+top_channels_d = np.argsort(channel_importances_d)[::-1]
+
+print("Delta Band Accuracy:",np.round(accuracy_d,3))
+print("Top 12 channels:")
+for channel in top_channels_d[:8]:
+    print(channel_names[channel])
+
+#Theta
+importances_t,accuracy_t = compute_feature_importances_cv(x_train_t, y_train_t)
+channel_importances_t = np.array([sum(importances_t[i:i+2]) for i in range(0, len(importances_t), 2)])
+
+top_channels_t = np.argsort(channel_importances_t)[::-1]
+
+print("Theta Band Accuracy:",np.round(accuracy_t,3))
+print("Top 12 channels:")
+for channel in top_channels_t[:12]:
+    print(channel_names[channel])
+
+
+#Alpha
+importances_a,accuracy_a = compute_feature_importances_cv(x_train_a, y_train_a)
+channel_importances_a = np.array([sum(importances_a[i:i+2]) for i in range(0, len(importances_a), 2)])
+
+top_channels_a = np.argsort(channel_importances_a)[::-1]
+
+print("Alpha Band Accuracy:",np.round(accuracy_a,3))
+print("Top 12 channels:")
+for channel in top_channels_a[:12]:
+    print(channel_names[channel])
+
+
+def channel_plot_psd(top_4_channel_list):
+    fig, axes = plt.subplots(2, 2, figsize=(15,10), sharey=False)
+    axes = axes.flatten()
+
+    for i, channels in enumerate(top_4_channel_list):
+        fam_data = stft_data_trials[:1330,:,:,channels]
+        unf_data = stft_data_trials[1330:,:,:,channels]
+
+        fam_data_mean = fam_data.mean(axis=(0, 2))
+        unf_data_mean = unf_data.mean(axis=(0, 2))
+
+        axes[i].plot(f_s[0:16], fam_data_mean[0:16], label='Familiar',color='red')
+        axes[i].plot(f_s[0:16], unf_data_mean[0:16], label='Unfamiliar',color='black')
+        axes[i].set_title(f'Channel {channel_names[channels]}')
+        axes[i].legend()
+        axes[i].set_xlabel('Frequency (Hz)')
+        axes[i].set_ylabel('μV')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def brain_plot_importance(rf_channel_importances_cv):
+    #Set montage
+    easycap_montage = mne.channels.make_standard_montage("standard_1020")
+    
+    standard_1020 = []
+    importance_1020 = []
+
+    for i, channel in enumerate(easycap_montage.ch_names):
+        if channel in channel_names:
+            standard_1020.append(channel)
+            importance_1020.append(rf_channel_importances_cv[channel_names.index(channel)])
+
+    if len(importance_1020) == 64:
+        print("All good")
+
+    #Change importance data to raw data
+    info = create_info(ch_names=standard_1020, sfreq=1000, ch_types='eeg')
+    info.set_montage(easycap_montage)
+
+    raw_data = np.zeros((len(importance_1020), 1))
+    raw_data[:, 0] = importance_1020
+
+    raw = RawArray(raw_data, info)
+
+    #Draw the plot
+    fig, ax = plt.subplots(figsize=(10, 5))
+    im, cn = plot_topomap(importance_1020, raw.info, axes=ax, show=False, cmap='viridis', names=standard_1020, sphere=0.11)
+
+    # Add color bar
+    #cbar = fig.colorbar(im, ax=ax)
+
+    # Set color bar limits
+    #im.set_clim(0, 1)
+    #cbar.set_ticks(np.linspace(0, 1, num=5))
+
+    #plt.title('EEG Channel Importance')
+    plt.show()
+    
+    
+scaler = MinMaxScaler()
+channel_importances_dn = scaler.fit_transform(channel_importances_d.reshape(-1,1))
+channel_importances_tn = scaler.fit_transform(channel_importances_t.reshape(-1,1))
+channel_importances_an = scaler.fit_transform(channel_importances_a.reshape(-1,1))
+
+
+#Divided data 
+importance_index_d = np.argsort(channel_importances_d)[::-1]
+importance_index_t = np.argsort(channel_importances_t)[::-1]
+importance_index_a = np.argsort(channel_importances_a)[::-1]
+
+    
+scaler = MinMaxScaler()
+
+
+#Delta Band
+#---------------------------------
+print('Delta Band',"--------------------------",sep='\n')
+#top channels
+top_4_channels_d = data_all_band[0][:, :,1:3, importance_index_d[:4]]
+top_8_channels_d = data_all_band[0][:, :,1:3, importance_index_d[:8]]
+top_12_channels_d = data_all_band[0][:, :,1:3, importance_index_d[:12]]
+top_16_channels_d = data_all_band[0][:, :,1:3, importance_index_d[:16]]
+last_4_channels_d = data_all_band[0][:, :,1:3, importance_index_d[-4:]]
+
+print("top 4 channels data shape",top_4_channels_d.shape)
+print("top 8 channels data shape",top_8_channels_d.shape)
+print("top 12 channels data shape",top_12_channels_d.shape)
+
+top_4_channels_data_d = scaler.fit_transform(top_4_channels_d.reshape(2660,-1))
+top_8_channels_data_d = scaler.fit_transform(top_8_channels_d.reshape(2660,-1))
+top_12_channels_data_d = scaler.fit_transform(top_12_channels_d.reshape(2660,-1))
+top_16_channels_data_d = scaler.fit_transform(top_16_channels_d.reshape(2660,-1))
+last_4_channels_data_d = scaler.fit_transform(last_4_channels_d.reshape(2660,-1))
+
+#ALL channels
+all_channels_d = data_all_band[0][:, :,1:3, :]
+print("ALL channels data shape",all_channels_d.shape)
+all_channels_data_d = all_channels_d.reshape(2660,-1)
+
+
+
+#Theta Band
+#---------------------------------
+print('Theta Band',"--------------------------",sep='\n')
+#top channels
+top_4_channels_t = data_all_band[1][:, :,1:3, importance_index_t[:4]]
+top_8_channels_t = data_all_band[1][:, :,1:3, importance_index_t[:8]]
+top_12_channels_t = data_all_band[1][:, :,1:3, importance_index_t[:12]]
+top_16_channels_t = data_all_band[1][:, :,1:3, importance_index_t[:16]]
+last_4_channels_t = data_all_band[1][:, :,1:3, importance_index_t[-4:]]
+
+
+print("top 4 channels data shape",top_4_channels_t.shape)
+print("top 8 channels data shape",top_8_channels_t.shape)
+print("top 12 channels data shape",top_12_channels_t.shape)
+
+top_4_channels_data_t = scaler.fit_transform(top_4_channels_t.reshape(2660,-1))
+top_8_channels_data_t = scaler.fit_transform(top_8_channels_t.reshape(2660,-1))
+top_12_channels_data_t = scaler.fit_transform(top_12_channels_t.reshape(2660,-1))
+top_16_channels_data_t = scaler.fit_transform(top_16_channels_t.reshape(2660,-1))
+last_4_channels_data_t = scaler.fit_transform(last_4_channels_t.reshape(2660,-1))
+
+#ALL channels
+all_channels_t = data_all_band[1][:, :,1:3, :]
+print("ALL channels data shape",all_channels_t.shape)
+all_channels_data_t = all_channels_t.reshape(2660,-1)
+
+
+
+#Alpha Band
+#---------------------------------
+print('Alpha Band',"--------------------------",sep='\n')
+#top channels
+top_4_channels_a = data_all_band[2][:, :,1:3, importance_index_a[:4]]
+top_8_channels_a = data_all_band[2][:, :,1:3, importance_index_a[:8]]
+top_12_channels_a = data_all_band[2][:, :,1:3, importance_index_a[:12]]
+top_16_channels_a = data_all_band[2][:, :,1:3, importance_index_a[:16]]
+last_4_channels_a = data_all_band[2][:, :,1:3, importance_index_a[-4:]]
+
+print("top 4 channels data shape",top_4_channels_a.shape)
+print("top 8 channels data shape",top_8_channels_a.shape)
+print("top 12 channels data shape",top_12_channels_a.shape)
+
+top_4_channels_data_a = scaler.fit_transform(top_4_channels_a.reshape(2660,-1))
+top_8_channels_data_a = scaler.fit_transform(top_8_channels_a.reshape(2660,-1))
+top_12_channels_data_a = scaler.fit_transform(top_12_channels_a.reshape(2660,-1))
+top_16_channels_data_a = scaler.fit_transform(top_16_channels_a.reshape(2660,-1))
+last_4_channels_data_a = scaler.fit_transform(last_4_channels_a.reshape(2660,-1))
+
+
+#ALL channels
+all_channels_a = data_all_band[2][:, :,1:3, :]
+print("ALL channels data shape",all_channels_a.shape)
+all_channels_data_a = all_channels_a.reshape(2660,-1)
+
+
+
+#Grid Search
+rf_grid = {
+    'n_estimators': [100, 200, 300],
+    'max_depth': [10, 20, 30],
+    'min_samples_split': [ 2, 6, 8]
+}
+
+xg_grid = {
+    'n_estimators': [100, 200, 300],
+    'max_depth': [10, 20, 30],
+    'learning_rate': [0.01, 0.1, 0.2]
+}
+
+svm_grid = {
+    'C': [1, 10, 100, 200],
+    'kernel': ['linear', 'rbf']
+}
+
+knn_grid = {
+    'n_neighbors': [3, 5, 7]
+}
+
+
+#Grid Search for KNN
+knn_gs = KNeighborsClassifier()
+
+grid_search_knn = GridSearchCV(estimator=knn_gs, param_grid=knn_grid, scoring='accuracy', cv=5, n_jobs=-1)
+grid_search_knn.fit(top_4_channels_data_d, data_all_label_model)
+print("Best parameters: ", grid_search_knn.best_params_)
+
+
+
+#Grid Search for RF
+rf_gs = RandomForestClassifier(random_state=2024)
+
+grid_search_rf = GridSearchCV(estimator=rf_gs, param_grid=rf_grid, scoring='accuracy', cv=5, n_jobs=-1)
+grid_search_rf.fit(top_12_channels_data_a, data_all_label_model)
+print("Best parameters: ", grid_search_rf.best_params_)
+
+
+#Grid Search for XGB
+xg_gs = xgb.XGBClassifier(
+        objective='multi:softmax',
+        num_class=2,
+        seed=2024)
+
+grid_search_xg = GridSearchCV(estimator=xg_gs, param_grid=xg_grid, scoring='accuracy', cv=5, n_jobs=-1)
+grid_search_xg.fit(top_4_channels_data_d, data_all_label_model)
+print("Best parameters: ", grid_search_xg.best_params_)
+
+
+#Grid Search for SVM
+svm_gs = SVC( random_state=2024)
+
+grid_search_svm = GridSearchCV(estimator=svm_gs, param_grid=svm_grid, scoring='accuracy', cv=5, n_jobs=-1)
+grid_search_svm.fit(top_4_channels_data_d, data_all_label_model)
+print("Best parameters: ", grid_search_svm.best_params_)
+
+
+def get_band_accuracy(x_data, y_data):
+    accuracy = [] 
+    #CV
+    kfold = StratifiedKFold(n_splits=3, shuffle=True, random_state=2024) 
+    
+    #KNN
+    knn = KNeighborsClassifier(n_neighbors=3)
+    accuracy_knn = cross_val_score(knn, x_data , y_data, cv=kfold, scoring='accuracy')
+    accuracy.append(np.round(np.mean(accuracy_knn),3))
+    
+    #RandomForest
+    rf = RandomForestClassifier(random_state=2024,n_estimators=300, max_depth=30,min_samples_split=2)
+    accuracy_rf = cross_val_score(rf, x_data, y_data, cv=kfold, scoring='accuracy')
+    accuracy_rf_mean = np.round(np.mean(accuracy_rf), 3)
+    accuracy.append(accuracy_rf_mean)
+    
+    #XGBoost
+    xg = xgb.XGBClassifier(objective='multi:softmax', num_class=2, seed=2024,
+                          n_estimators=200, max_depth=10,learning_rate=0.1)
+    accuracy_xg = cross_val_score(xg, x_data, y_data, cv=kfold, scoring='accuracy')
+    accuracy.append(np.round(np.mean(accuracy_xg),3))
+    
+    #SVM
+    svm_model = SVC(kernel='rbf', C=200, random_state=2024)
+    accuracy_svm = cross_val_score(svm_model, x_data, y_data, cv=kfold, scoring='accuracy')
+    accuracy.append(np.round(np.mean(accuracy_svm),3))
+    
+    return print(accuracy)
+
+
+get_band_accuracy(top_4_channels_data_d,data_all_label_model)
+get_band_accuracy(top_8_channels_data_d,data_all_label_model)
+get_band_accuracy(top_12_channels_data_d,data_all_label_model)
+get_band_accuracy(top_16_channels_data_d,data_all_label_model)
+get_band_accuracy(last_4_channels_data_d,data_all_label_model)
+get_band_accuracy(all_channels_data_d,data_all_label_model)
+
+
+get_band_accuracy(top_4_channels_data_t,data_all_label_model)
+get_band_accuracy(top_8_channels_data_t,data_all_label_model)
+get_band_accuracy(top_12_channels_data_t,data_all_label_model)
+get_band_accuracy(top_16_channels_data_t,data_all_label_model)
+get_band_accuracy(last_4_channels_data_t,data_all_label_model)
+get_band_accuracy(all_channels_data_t,data_all_label_model)
+
+
+get_band_accuracy(top_4_channels_data_a,data_all_label_model)
+get_band_accuracy(top_8_channels_data_a,data_all_label_model)
+get_band_accuracy(top_12_channels_data_a,data_all_label_model)
+get_band_accuracy(top_16_channels_data_a,data_all_label_model)
+get_band_accuracy(last_4_channels_data_a,data_all_label_model)
+get_band_accuracy(all_channels_data_a,data_all_label_model)
+
+
+
+
+#plot for N170 and N250
+def channel_plot_top4_a(top_4_channel_list):
+    data_all_channels = data_all_model.reshape(2660 * 510, 64)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15,10), sharey=True)
+    axes = axes.flatten()
+
+    for i, channels in enumerate(top_4_channel_list):
+        channels_data = data_all_channels[:, channels]
+        part_number = len(channels_data) // 2
+        trials_number = part_number // 510
+
+        fam_data = channels_data[:part_number]
+        fam_data_reshape = fam_data.reshape(trials_number, 510)  
+        fam_data_mean = fam_data_reshape.mean(axis=0)
+
+        unf_data = channels_data[part_number:]
+        unf_data_reshape = unf_data.reshape(trials_number, 510)  
+        unf_data_mean = unf_data_reshape.mean(axis=0)
+        
+        # Change samples to time
+        time_points = np.linspace(0, 1000, num=510)
+
+        axes[i].plot(time_points, fam_data_mean, label='Familiar',color='red')
+        axes[i].plot(time_points, unf_data_mean, label='Unfamiliar',color='black')
+        axes[i].set_title(f'Channel {channel_names[channels]}')
+        axes[i].legend()
+        axes[i].set_xlabel('Time (ms)')
+        axes[i].set_ylabel('Voltage (μV)')
+
+        # Add vertical shaded area
+        axes[i].axvspan(130, 200, color='Grey', alpha=0.3)
+        axes[i].axvspan(200, 400, color='Grey', alpha=0.3)
+
+    # Remove empty plot
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
